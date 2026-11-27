@@ -46,7 +46,7 @@ def surveiller(gps, capteurs, navigation=None):
                     return
                 angle = ""
                 if navigation.etat == "ROTATION" and cap is not None:
-                    angle = f" (cap {cap:.1f}°, cible {navigation.cap_cible:.1f}°)"
+                    angle = f" (cap {round(cap, 1) % 360:.1f} deg, cible {round(navigation.cap_cible, 1) % 360:.1f} deg)"
                 print(f"Côté {navigation.cote + 1}/4 — {detail}{angle}", flush=True)
                 dernier_etat = etat
         time.sleep(0.02)
@@ -61,7 +61,7 @@ def main(arguments=None):
     p.add_argument("--qualite-min", type=int, default=50, help="Qualité Qorvo minimale sur 100.")
     p.add_argument("--age-gps", type=float, default=1.0, help="Âge maximal d'une position en secondes.")
     p.add_argument("--port-lidar", default="/dev/ttyUSB0")
-    p.add_argument("--modele-lidar", choices=("x2", "x4"), default="x2")
+    p.add_argument("--modele-lidar", choices=("x2", "x4"), default="x4")
     p.add_argument("--avant-lidar", type=float, default=180, help="Angle du devant dans le repère lidar en degrés.")
     p.add_argument("--distance-obstacle", type=float, default=0.50, help="Profondeur surveillée depuis le lidar en mètres.")
     p.add_argument("--largeur-robot", type=float, default=0.24, help="Largeur du passage surveillé en mètres.")

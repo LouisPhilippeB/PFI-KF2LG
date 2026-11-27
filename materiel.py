@@ -16,6 +16,7 @@ PERIODE_IMU = 0.01
 AGE_MAX_IMU = 0.25
 DUREE_BIAIS = 1.0
 AGE_MAX_LIDAR = 0.50
+DELAI_FERMETURE_LIDAR = 6.0
 
 
 def creer_robot():
@@ -214,9 +215,10 @@ class Capteurs:
         if self._imu is not None and self._imu.ident is not None:
             self._imu.join(timeout=AGE_MAX_IMU)
         if self._lidar is not None:
-            self._lidar.join(timeout=1.0)
+            # Une lecture en cours, turnOff et disconnecting peuvent dépasser 1 s.
+            self._lidar.join(timeout=DELAI_FERMETURE_LIDAR)
             if self._lidar.is_alive():
-                self._lidar.terminate()
+                self._lidar.kill()
                 self._lidar.join(timeout=1.0)
             if not self._lidar.is_alive():
                 self._lidar.close()

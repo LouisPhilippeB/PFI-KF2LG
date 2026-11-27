@@ -45,6 +45,7 @@ class NavigationRectangle:
         self._vitesse_pivot = 180.0
         self._repos_fin = 0.0
         self._stable_depuis = None
+        self._apres_rotation = "AVANCE"
 
     @property
     def termine(self):
@@ -94,11 +95,34 @@ class NavigationRectangle:
         dx, dy = point[0] - debut[0], point[1] - debut[1]
         return longueur - (dx * ux + dy * uy), ux * dy - uy * dx
 
-    def _orienter(self):
+    def _cap_du_cote(self):
         debut = self.sommets[self.cote]
         fin = self.sommets[(self.cote + 1) % 4]
         direction = math.degrees(math.atan2(fin[1] - debut[1], fin[0] - debut[0]))
-        self.cap_cible = (direction - self._radio_moins_imu) % 360.0
+        return (direction - self._radio_moins_imu) % 360.0
+
+    def _orienter(self):
+        self.cap_cible = self._cap_du_cote()
+        self._apres_rotation = "AVANCE"
+        self._changer_etat("ROTATION")
+
+    def _approcher_coin(self, repos):
+        """Choisir le cap à l'arrêt, puis avancer par impulsion et remesurer."""
+        cible = self.sommets[(self.cote + 1) % 4]
+        restant, lateral = self._position_sur_cote(repos)
+        cap_cote = self._cap_du_cote()
+        marge = 0.9 * self.tolerance
+        if restant > 2 * self.tolerance and abs(lateral) <= marge:
+            self._orienter()
+            return
+        if restant > 0 and abs(lateral) <= marge:
+            self.cap_cible = cap_cote
+        elif self.cote < 3 and lateral < 0 and abs(restant) <= marge:
+            self.cap_cible = (cap_cote + 90) % 360
+        else:
+            direction = math.degrees(math.atan2(cible[1] - repos[1], cible[0] - repos[0]))
+            self.cap_cible = (direction - self._radio_moins_imu) % 360
+        self._apres_rotation = "APPROCHE DU COIN"
         self._changer_etat("ROTATION")
 
     def _rotation(self, maintenant, cap):
@@ -124,7 +148,7 @@ class NavigationRectangle:
             if self._stable_depuis is None:
                 self._stable_depuis = maintenant
             if maintenant - self._stable_depuis >= 0.20:
-                self._changer_etat("AVANCE")
+                self._changer_etat(self._apres_rotation)
             return
         self._stable_depuis = None
         self._cap_impulsion = cap
@@ -169,7 +193,7 @@ class NavigationRectangle:
             restant, lateral = self._position_sur_cote(filtre)
             approche = nouveau and (math.dist(point, cible) <= self.tolerance
                                     or self._position_sur_cote(point)[0] <= 0)
-            if approche or math.dist(filtre, cible) <= self.tolerance or restant <= 0:
+            if approche or math.dist(filtre, cible) <= 2 * self.tolerance or restant <= 0:
                 self._changer_etat("CONFIRMATION DU COIN")
             else:
                 correction = math.degrees(math.atan2(-lateral, max(0.45, 3 * self.tolerance)))
@@ -179,15 +203,18 @@ class NavigationRectangle:
                     self._orienter()
                 else:
                     self._avancer(erreur, filtre)
+        elif self.etat == "APPROCHE DU COIN":
+            cible = self.sommets[(self.cote + 1) % 4]
+            if self._temps_etat >= 0.18 or math.dist(point, cible) <= self.tolerance:
+                self._changer_etat("CONFIRMATION DU COIN")
+            else:
+                self._avancer(ecart_cap(self.cap_cible, cap), filtre)
         elif self.etat == "CONFIRMATION DU COIN":
             repos = self._position_au_repos(nouveau, point)
             if repos is None:
                 return
             if math.dist(repos, self.sommets[(self.cote + 1) % 4]) > self.tolerance:
-                restant, _ = self._position_sur_cote(repos)
-                if restant <= 0:
-                    raise RuntimeError(f"Coin {self.cote + 1} dépassé hors tolérance. Position GPS à l'arrêt : {repos}.")
-                self._changer_etat("AVANCE")
+                self._approcher_coin(repos)
                 return
             self.cote += 1
             self._temps_cote = 0.0
