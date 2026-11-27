@@ -126,8 +126,6 @@ class NavigationRectangle:
         return min(2 * self.tolerance, min(self.longueur, self.largeur) / 4)
 
     def _coin_atteint(self, restant, lateral):
-        # Viser le bout du côté même avec un GPS précis. Accepter un passage
-        # légèrement au-delà si la médiane reste dans le voisinage du sommet.
         avance_manquante = min(self.tolerance, max(self.tolerance / 3, self._dispersion))
         return restant <= avance_manquante and math.hypot(restant, lateral) <= self._rayon_coin()
 
@@ -135,14 +133,11 @@ class NavigationRectangle:
         cible = self.sommets[(self.cote + 1) % 4]
         cap_cote = self._cap_du_cote()
         distance = math.hypot(restant, lateral)
-        # Une seule trame a pu faire freiner très tôt. Reprendre la ligne
-        # si les mesures à l'arrêt placent le coin au-delà de la zone de freinage.
         seuil_reprise = 2 * self.tolerance + self._vitesse_avance * (2 * median(self._intervalles_gps) + 0.18)
         if restant > seuil_reprise:
             self._orienter()
             return
         if restant > 0 and abs(lateral) <= self._rayon_coin() * 0.9:
-            # Compléter la longueur du côté sans tourner vers un seul point bruité.
             self.cap_cible = cap_cote
             distance = restant
         else:
@@ -196,8 +191,6 @@ class NavigationRectangle:
         self.robot.avancer_corrige(max(-0.05, min(0.05, erreur * 0.004)))
 
     def _distance_freinage(self, maintenant, nouveau, restant):
-        # Réestimer la vitesse sur une portion de ligne droite, entre deux
-        # positions filtrées assez éloignées dans le temps pour limiter le bruit.
         if nouveau:
             if self._reference_vitesse is None:
                 self._reference_vitesse = self._dernier_fix, restant
@@ -208,7 +201,6 @@ class NavigationRectangle:
                 if 0.4 * self._vitesse_avance <= vitesse <= 2.5 * self._vitesse_avance:
                     self._vitesse_avance = 0.6 * self._vitesse_avance + 0.4 * vitesse
                 self._reference_vitesse = self._dernier_fix, restant
-        # Retard de la médiane mobile, âge du dernier fix et roue libre.
         delai = median(self._intervalles_gps) + (maintenant - self._dernier_fix) + 0.18
         return self.tolerance + self._vitesse_avance * delai
 
@@ -247,7 +239,6 @@ class NavigationRectangle:
                 else:
                     self._avancer(erreur, filtre)
         elif self.etat == "APPROCHE DU COIN":
-            # Une trame aberrante ne doit pas annuler chaque petite avance.
             if self._fin_approche is None:
                 self._fin_approche = maintenant + self._duree_approche
             if maintenant >= self._fin_approche:
