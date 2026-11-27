@@ -41,6 +41,8 @@ class NavigationRectangle:
         self._repere_avance = None
         self._temps_repere = 0.0
         self._impulsion_fin = None
+        self._sens_impulsion = 0
+        self._vitesse_pivot = 180.0
         self._repos_fin = 0.0
         self._stable_depuis = None
 
@@ -82,42 +84,53 @@ class NavigationRectangle:
         p3 = x - self.largeur * uy, y + self.largeur * ux
         p2 = p1[0] - self.largeur * uy, p1[1] + self.largeur * ux
         self.sommets = (self.depart, p1, p2, p3)
-        self._orienter(point)
+        self._orienter()
 
-    def _cap_de_route(self, point):
+    def _position_sur_cote(self, point):
         debut = self.sommets[self.cote]
         fin = self.sommets[(self.cote + 1) % 4]
         longueur = math.dist(debut, fin)
         ux, uy = (fin[0] - debut[0]) / longueur, (fin[1] - debut[1]) / longueur
-        projection = (point[0] - debut[0]) * ux + (point[1] - debut[1]) * uy
-        visee = min(longueur, max(0.0, projection) + max(0.45, 3 * self.tolerance))
-        dx = debut[0] + visee * ux - point[0]
-        dy = debut[1] + visee * uy - point[1]
-        return math.degrees(math.atan2(dy, dx)) - self._radio_moins_imu
+        dx, dy = point[0] - debut[0], point[1] - debut[1]
+        return longueur - (dx * ux + dy * uy), ux * dy - uy * dx
 
-    def _orienter(self, point):
-        self._cap_cible = self._cap_de_route(point)
+    def _orienter(self):
+        debut = self.sommets[self.cote]
+        fin = self.sommets[(self.cote + 1) % 4]
+        direction = math.degrees(math.atan2(fin[1] - debut[1], fin[0] - debut[0]))
+        self.cap_cible = (direction - self._radio_moins_imu) % 360.0
         self._changer_etat("ROTATION")
 
     def _rotation(self, maintenant, cap):
-        erreur = ecart_cap(self._cap_cible, cap)
-        if abs(erreur) <= 3.0:
+        erreur = ecart_cap(self.cap_cible, cap)
+        if self._impulsion_fin is not None:
+            if maintenant < self._impulsion_fin and erreur * self._sens_impulsion > 4:
+                return
             self.robot.arreter()
+            self._duree_impulsion = max(0.001, maintenant - self._debut_impulsion)
             self._impulsion_fin = None
+            self._repos_fin = maintenant + 0.22
+            return
+        if maintenant < self._repos_fin:
+            return
+        if self._sens_impulsion:
+            progres = self._sens_impulsion * ecart_cap(cap, self._cap_impulsion)
+            self._sens_impulsion = 0
+            if progres < -6:
+                raise RuntimeError("Pivot mesuré en sens inverse. Vérifier le signe avec --diagnostic et --sens-gyro.")
+            if progres > 1:
+                self._vitesse_pivot = max(35, min(500, progres / self._duree_impulsion))
+        if abs(erreur) <= 4:
             if self._stable_depuis is None:
                 self._stable_depuis = maintenant
             if maintenant - self._stable_depuis >= 0.20:
                 self._changer_etat("AVANCE")
             return
         self._stable_depuis = None
-        if self._impulsion_fin is not None and maintenant >= self._impulsion_fin:
-            self._impulsion_fin = None
-            self._repos_fin = maintenant + 0.12
-        if maintenant < self._repos_fin:
-            self.robot.arreter()
-            return
-        if abs(erreur) < 20 and self._impulsion_fin is None:
-            self._impulsion_fin = maintenant + max(0.025, min(0.12, abs(erreur) / 150))
+        self._cap_impulsion = cap
+        self._debut_impulsion = maintenant
+        self._sens_impulsion = 1 if erreur > 0 else -1
+        self._impulsion_fin = maintenant + max(0.020, min(0.25, 0.70 * abs(erreur) / self._vitesse_pivot))
         if erreur > 0:
             self.robot.pivoter_gauche()
         else:
@@ -153,12 +166,17 @@ class NavigationRectangle:
             self._rotation(maintenant, cap)
         elif self.etat == "AVANCE":
             cible = self.sommets[(self.cote + 1) % 4]
-            if math.dist(filtre, cible) <= self.tolerance:
+            restant, lateral = self._position_sur_cote(filtre)
+            approche = nouveau and (math.dist(point, cible) <= self.tolerance
+                                    or self._position_sur_cote(point)[0] <= 0)
+            if approche or math.dist(filtre, cible) <= self.tolerance or restant <= 0:
                 self._changer_etat("CONFIRMATION DU COIN")
             else:
-                erreur = ecart_cap(self._cap_de_route(filtre), cap)
-                if abs(erreur) > 20:
-                    self._orienter(filtre)
+                correction = math.degrees(math.atan2(-lateral, max(0.45, 3 * self.tolerance)))
+                consigne = self.cap_cible + max(-18, min(18, correction))
+                erreur = ecart_cap(consigne, cap)
+                if abs(ecart_cap(self.cap_cible, cap)) > 35:
+                    self._orienter()
                 else:
                     self._avancer(erreur, filtre)
         elif self.etat == "CONFIRMATION DU COIN":
@@ -166,14 +184,17 @@ class NavigationRectangle:
             if repos is None:
                 return
             if math.dist(repos, self.sommets[(self.cote + 1) % 4]) > self.tolerance:
-                self._orienter(repos)
+                restant, _ = self._position_sur_cote(repos)
+                if restant <= 0:
+                    raise RuntimeError(f"Coin {self.cote + 1} dépassé hors tolérance. Position GPS à l'arrêt : {repos}.")
+                self._changer_etat("AVANCE")
                 return
             self.cote += 1
             self._temps_cote = 0.0
             if self.cote == 4:
                 self._changer_etat("TERMINÉ")
             else:
-                self._orienter(repos)
+                self._orienter()
 
     def actualiser(self, maintenant, mesure, cap, voie_libre):
         if self.termine:
@@ -183,7 +204,12 @@ class NavigationRectangle:
         radio_valide = (mesure is not None and all(map(math.isfinite, mesure))
                         and 0 <= maintenant - mesure[0] <= self.age_gps
                         and mesure[0] >= self._dernier_fix)
+        nouveau = radio_valide and mesure[0] > self._dernier_fix
+        if nouveau:
+            self._dernier_fix, x, y = mesure
+            self._points.append((x, y))
         if not radio_valide:
+            self._points.clear()
             self.attente = "position Qorvo indisponible"
         elif cap is None or not math.isfinite(cap):
             self.attente = "gyroscope indisponible ou en étalonnage"
@@ -193,16 +219,24 @@ class NavigationRectangle:
             self.attente = ""
         if self.attente:
             self.robot.arreter()
-            self._libre_depuis = self._stable_depuis = self._impulsion_fin = None
-            self._fixes_repos.clear()
-            self._points.clear()
+            cap_valide = cap is not None and math.isfinite(cap)
+            if voie_libre is False or not radio_valide or not cap_valide:
+                self._libre_depuis = None
+            if self._impulsion_fin is not None:
+                self._duree_impulsion = max(0.001, maintenant - self._debut_impulsion)
+                self._impulsion_fin = None
+                self._repos_fin = maintenant + 0.22
+            if not cap_valide:
+                self._sens_impulsion = 0
+            if self._stable_depuis is not None and (not cap_valide or abs(ecart_cap(self.cap_cible, cap)) > 4):
+                self._stable_depuis = None
+            if not radio_valide:
+                self._fixes_repos.clear()
+            elif nouveau and self.etat in ("DÉPART", "MESURE DU CAP", "CONFIRMATION DU COIN"):
+                self._position_au_repos(True, (x, y))
             return
 
-        horodatage, x, y = mesure
-        nouveau = horodatage > self._dernier_fix
-        if nouveau:
-            self._dernier_fix = horodatage
-            self._points.append((x, y))
+        _, x, y = mesure
         if self._libre_depuis is None:
             self._libre_depuis = maintenant
         if maintenant - self._libre_depuis < 0.20 or len(self._points) < 2:

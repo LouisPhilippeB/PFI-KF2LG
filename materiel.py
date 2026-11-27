@@ -36,8 +36,8 @@ def creer_robot():
         return robot
 
 
-def passage_libre(points, avant, profondeur, largeur, distance_max):
-    secteurs_vus = set()
+def analyser_passage(points, avant, profondeur, largeur, distance_max):
+    angles_avant = set()
     for distance, angle in points:
         if not (math.isfinite(angle) and 0 < distance <= distance_max):
             continue
@@ -45,28 +45,44 @@ def passage_libre(points, avant, profondeur, largeur, distance_max):
         longitudinal = distance * math.cos(ecart)
         lateral = distance * math.sin(ecart)
         if 0 < longitudinal <= profondeur and abs(lateral) <= largeur / 2:
-            return False
-        if abs(ecart) <= math.radians(10):
-            if abs(ecart) <= math.radians(3):
-                secteurs_vus.add("centre")
-            else:
-                secteurs_vus.add("gauche" if ecart > 0 else "droite")
-    return True if len(secteurs_vus) == 3 else None
+            return False, "obstacle"
+        if abs(ecart) <= math.radians(14):
+            angles_avant.add(math.degrees(ecart))
+    if not angles_avant:
+        return None, "aucun retour frontal valide"
+    bas, haut = min(angles_avant), max(angles_avant)
+    if bas < -3 and haut > 3 and any(bas < a < haut and abs(a) <= 4 for a in angles_avant):
+        return True, "libre"
+    return None, "couverture frontale incomplète"
+
+
+def passage_libre(points, avant, profondeur, largeur, distance_max):
+    return analyser_passage(points, avant, profondeur, largeur, distance_max)[0]
 
 
 def _acquerir_lidar(canal, fin, port, modele, avant, profondeur, largeur):
     lidar = Lidar(port, modele)
     try:
         lidar.demarrer()
+        echecs = 0
         while not fin.is_set():
             if not lidar.est_actif():
                 raise RuntimeError("Le lidar a cessé de tourner.")
             debut = time.monotonic()
-            points = lidar.obtenir_donnees()
-            libre = passage_libre(points, avant, profondeur, largeur, lidar.MODELES[modele]["distance_max"])
-            canal.send((debut, libre, None))
+            try:
+                points = lidar.obtenir_donnees()
+            except RuntimeError:
+                echecs += 1
+                if echecs >= 3:
+                    raise
+                canal.send((debut, None, "échec de lecture du scan", None))
+                fin.wait(1 / lidar.MODELES[modele]["frequence"])
+                continue
+            echecs = 0
+            libre, motif = analyser_passage(points, avant, profondeur, largeur, lidar.MODELES[modele]["distance_max"])
+            canal.send((debut, libre, motif, None))
     except Exception as erreur:
-        canal.send((time.monotonic(), None, f"Lidar : {erreur}"))
+        canal.send((time.monotonic(), None, "défaut lidar", f"Lidar : {erreur}"))
     finally:
         try:
             lidar.arreter()
@@ -92,6 +108,7 @@ class Capteurs:
         self._cap = self._instant_cap = None
         self._erreur_imu = self._erreur_lidar = None
         self._instant_scan = self._libre = None
+        self.etat_lidar = "en attente du premier scan"
         self._imu = self._lidar = self._canal = self._fin_lidar = None
 
     def demarrer(self):
@@ -153,8 +170,7 @@ class Capteurs:
                 if interruption:
                     raise RuntimeError("Échantillonnage interrompu, le cap doit être réinitialisé au départ.")
                 vitesse = (gx - biais) * self._sens_gyro
-                angle += (vitesse_precedente + vitesse) * (instant - instant_precedent) / 2
-                angle %= 360
+                angle = (angle + (vitesse_precedente + vitesse) * (instant - instant_precedent) / 2) % 360.0
                 vitesse_precedente = vitesse
             if biais is not None:
                 with self._verrou:
@@ -173,13 +189,16 @@ class Capteurs:
             return None
         try:
             while self._canal.poll():
-                self._instant_scan, self._libre, self._erreur_lidar = self._canal.recv()
+                self._instant_scan, self._libre, self.etat_lidar, self._erreur_lidar = self._canal.recv()
                 if self._erreur_lidar:
                     return None
         except (OSError, EOFError) as erreur:
             self._erreur_lidar = f"Connexion au lidar perdue ({type(erreur).__name__})."
             return None
-        if self._instant_scan is None or time.monotonic() - self._instant_scan > AGE_MAX_LIDAR:
+        if self._instant_scan is None:
+            return None
+        if time.monotonic() - self._instant_scan > AGE_MAX_LIDAR:
+            self.etat_lidar = "scan périmé (> 0,50 s)"
             return None
         return self._libre
 

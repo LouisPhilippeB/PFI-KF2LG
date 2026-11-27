@@ -27,7 +27,7 @@ def surveiller(gps, capteurs, navigation=None):
             if maintenant >= prochain_affichage:
                 xy = "en attente" if mesure is None else f"({mesure[1]:.2f}, {mesure[2]:.2f}) m"
                 angle = "en attente" if cap is None else f"{cap:+.1f}°"
-                passage = {None: "inconnu", False: "obstacle", True: "libre"}[libre]
+                passage = capteurs.etat_lidar
                 print(f"GPS {xy} | cap relatif {angle} | lidar {passage}", flush=True)
                 prochain_affichage = maintenant + 0.5
         else:
@@ -36,13 +36,18 @@ def surveiller(gps, capteurs, navigation=None):
                 coins = " → ".join(f"({x:.2f}, {y:.2f})" for x, y in navigation.sommets)
                 print(f"Sommets du rectangle en mètres — {coins}", flush=True)
                 coins_affiches = True
-            etat = (navigation.etat, navigation.attente, navigation.cote)
+            detail = navigation.attente or navigation.etat.lower()
+            if detail == "scan lidar indisponible":
+                detail = f"lidar — {capteurs.etat_lidar}"
+            etat = (navigation.etat, detail, navigation.cote)
             if etat != dernier_etat:
                 if navigation.termine:
                     print("Rectangle terminé. Robot arrêté au point de départ.", flush=True)
                     return
-                detail = navigation.attente or navigation.etat.lower()
-                print(f"Côté {navigation.cote + 1}/4 — {detail}", flush=True)
+                angle = ""
+                if navigation.etat == "ROTATION" and cap is not None:
+                    angle = f" (cap {cap:.1f}°, cible {navigation.cap_cible:.1f}°)"
+                print(f"Côté {navigation.cote + 1}/4 — {detail}{angle}", flush=True)
                 dernier_etat = etat
         time.sleep(0.02)
 
