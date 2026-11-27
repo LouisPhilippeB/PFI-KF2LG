@@ -215,7 +215,6 @@ class Capteurs:
         if self._imu is not None and self._imu.ident is not None:
             self._imu.join(timeout=AGE_MAX_IMU)
         if self._lidar is not None:
-            # Une lecture en cours, turnOff et disconnecting peuvent dépasser 1 s.
             self._lidar.join(timeout=DELAI_FERMETURE_LIDAR)
             if self._lidar.is_alive():
                 self._lidar.kill()

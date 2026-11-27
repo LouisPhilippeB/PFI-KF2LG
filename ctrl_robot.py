@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import ExitStack
+import math
 import sys
 import time
 
@@ -15,6 +16,7 @@ def surveiller(gps, capteurs, navigation=None):
     dernier_etat = None
     prochain_affichage = 0.0
     coins_affiches = False
+    dernier_coin = 0
     while True:
         mesure = gps.mesure()
         cap = capteurs.cap()
@@ -36,6 +38,15 @@ def surveiller(gps, capteurs, navigation=None):
                 coins = " → ".join(f"({x:.2f}, {y:.2f})" for x, y in navigation.sommets)
                 print(f"Sommets du rectangle en mètres — {coins}", flush=True)
                 coins_affiches = True
+            if navigation.cote > dernier_coin:
+                precedent, coin = navigation.coins_mesures[-2:]
+                cible = navigation.sommets[navigation.cote % 4]
+                longueur_voulue = math.dist(navigation.sommets[dernier_coin], cible)
+                print(f"Coin {navigation.cote} confirme | GPS ({coin[0]:.2f}, {coin[1]:.2f}) m "
+                      f"| cible ({cible[0]:.2f}, {cible[1]:.2f}) m "
+                      f"| entre arrets {math.dist(precedent, coin):.2f} m / {longueur_voulue:.2f} m",
+                      flush=True)
+                dernier_coin = navigation.cote
             detail = navigation.attente or navigation.etat.lower()
             if detail == "scan lidar indisponible":
                 detail = f"lidar — {capteurs.etat_lidar}"
@@ -56,7 +67,7 @@ def main(arguments=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--longueur", type=float, default=2.0, help="Premier côté en mètres.")
     p.add_argument("--largeur", type=float, default=1.2, help="Deuxième côté, à gauche, en mètres.")
-    p.add_argument("--tolerance", type=float, default=0.15, help="Rayon d'arrivée à un coin en mètres.")
+    p.add_argument("--tolerance", type=float, default=0.15, help="Tolérance GPS en mètres et rayon d'arrivée final (0.15).")
     p.add_argument("--port-gps", default="/dev/ttyACM0")
     p.add_argument("--qualite-min", type=int, default=50, help="Qualité Qorvo minimale sur 100.")
     p.add_argument("--age-gps", type=float, default=1.0, help="Âge maximal d'une position en secondes.")

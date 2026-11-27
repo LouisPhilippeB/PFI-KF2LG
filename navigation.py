@@ -30,9 +30,14 @@ class NavigationRectangle:
         self.etat = "DÉPART"
         self.attente = ""
         self.sommets = ()
+        self.coins_mesures = []
         self.cote = 0
         self._points = deque(maxlen=3)
-        self._fixes_repos = deque(maxlen=3)
+        self._fixes_repos = deque(maxlen=5)
+        self._dernier_fix_repos = -math.inf
+        self._dispersion = 0.0
+        self._intervalles_gps = deque(maxlen=5)
+        self._duree_amorce = 0.0
         self._dernier_fix = -math.inf
         self._precedent = None
         self._libre_depuis = None
@@ -56,18 +61,25 @@ class NavigationRectangle:
         self._temps_etat = 0.0
         self._repere_avance = None
         self._fixes_repos.clear()
+        self._dernier_fix_repos = -math.inf
+        self._reference_vitesse = None
+        self._fin_approche = None
         self._impulsion_fin = self._stable_depuis = None
         self._repos_fin = 0.0
         self.robot.arreter()
 
     def _position_au_repos(self, nouveau, point):
-        if self._temps_etat < 0.25 or not nouveau:
+        if self._temps_etat < 0.25 or not nouveau or self._dernier_fix - self._dernier_fix_repos < 0.24:
             return None
+        self._dernier_fix_repos = self._dernier_fix
         self._fixes_repos.append(point)
-        if len(self._fixes_repos) == 3:
+        if len(self._fixes_repos) == self._fixes_repos.maxlen:
             centre = position_mediane(self._fixes_repos)
-            if all(math.dist(centre, p) <= self.tolerance for p in self._fixes_repos):
+            self._dispersion = median(math.dist(centre, p) for p in self._fixes_repos)
+            if self._dispersion <= 1.5 * self.tolerance:
                 return centre
+            if not self.attente and self._temps_etat > max(7, 8 * median(self._intervalles_gps)):
+                raise RuntimeError(f"Position GPS trop dispersée à l'arrêt ({self._dispersion:.2f} m).")
         return None
 
     def _definir_rectangle(self, point, cap):
@@ -85,6 +97,8 @@ class NavigationRectangle:
         p3 = x - self.largeur * uy, y + self.largeur * ux
         p2 = p1[0] - self.largeur * uy, p1[1] + self.largeur * ux
         self.sommets = (self.depart, p1, p2, p3)
+        self.coins_mesures = [self.depart]
+        self._vitesse_avance = distance / max(0.01, self._duree_amorce)
         self._orienter()
 
     def _position_sur_cote(self, point):
@@ -106,24 +120,37 @@ class NavigationRectangle:
         self._apres_rotation = "AVANCE"
         self._changer_etat("ROTATION")
 
-    def _approcher_coin(self, repos):
-        """Choisir le cap à l'arrêt, puis avancer par impulsion et remesurer."""
+    def _rayon_coin(self):
+        if self.cote == 3:
+            return self.tolerance
+        return min(2 * self.tolerance, min(self.longueur, self.largeur) / 4)
+
+    def _coin_atteint(self, restant, lateral):
+        # Viser le bout du côté même avec un GPS précis. Accepter un passage
+        # légèrement au-delà si la médiane reste dans le voisinage du sommet.
+        avance_manquante = min(self.tolerance, max(self.tolerance / 3, self._dispersion))
+        return restant <= avance_manquante and math.hypot(restant, lateral) <= self._rayon_coin()
+
+    def _approcher_coin(self, repos, cap, restant, lateral):
         cible = self.sommets[(self.cote + 1) % 4]
-        restant, lateral = self._position_sur_cote(repos)
         cap_cote = self._cap_du_cote()
-        marge = 0.9 * self.tolerance
-        if restant > 2 * self.tolerance and abs(lateral) <= marge:
+        distance = math.hypot(restant, lateral)
+        # Une seule trame a pu faire freiner très tôt. Reprendre la ligne
+        # si les mesures à l'arrêt placent le coin au-delà de la zone de freinage.
+        seuil_reprise = 2 * self.tolerance + self._vitesse_avance * (2 * median(self._intervalles_gps) + 0.18)
+        if restant > seuil_reprise:
             self._orienter()
             return
-        if restant > 0 and abs(lateral) <= marge:
+        if restant > 0 and abs(lateral) <= self._rayon_coin() * 0.9:
+            # Compléter la longueur du côté sans tourner vers un seul point bruité.
             self.cap_cible = cap_cote
-        elif self.cote < 3 and lateral < 0 and abs(restant) <= marge:
-            self.cap_cible = (cap_cote + 90) % 360
+            distance = restant
         else:
             direction = math.degrees(math.atan2(cible[1] - repos[1], cible[0] - repos[0]))
             self.cap_cible = (direction - self._radio_moins_imu) % 360
+        self._duree_approche = max(0.06, min(0.35, 0.75 * distance / self._vitesse_avance))
         self._apres_rotation = "APPROCHE DU COIN"
-        self._changer_etat("ROTATION")
+        self._changer_etat("ROTATION" if abs(ecart_cap(self.cap_cible, cap)) > 8 else self._apres_rotation)
 
     def _rotation(self, maintenant, cap):
         erreur = ecart_cap(self.cap_cible, cap)
@@ -168,6 +195,23 @@ class NavigationRectangle:
             raise RuntimeError("Avance commandée, mais le GPS ne mesure pas de déplacement de 10 cm en 6 s.")
         self.robot.avancer_corrige(max(-0.05, min(0.05, erreur * 0.004)))
 
+    def _distance_freinage(self, maintenant, nouveau, restant):
+        # Réestimer la vitesse sur une portion de ligne droite, entre deux
+        # positions filtrées assez éloignées dans le temps pour limiter le bruit.
+        if nouveau:
+            if self._reference_vitesse is None:
+                self._reference_vitesse = self._dernier_fix, restant
+            instant, restant_avant = self._reference_vitesse
+            duree = self._dernier_fix - instant
+            if duree >= 0.8:
+                vitesse = (restant_avant - restant) / duree
+                if 0.4 * self._vitesse_avance <= vitesse <= 2.5 * self._vitesse_avance:
+                    self._vitesse_avance = 0.6 * self._vitesse_avance + 0.4 * vitesse
+                self._reference_vitesse = self._dernier_fix, restant
+        # Retard de la médiane mobile, âge du dernier fix et roue libre.
+        delai = median(self._intervalles_gps) + (maintenant - self._dernier_fix) + 0.18
+        return self.tolerance + self._vitesse_avance * delai
+
     def _etape(self, maintenant, nouveau, point, filtre, cap):
         if self.etat == "DÉPART":
             depart = self._position_au_repos(nouveau, point)
@@ -179,6 +223,7 @@ class NavigationRectangle:
             if abs(erreur) > 20:
                 raise RuntimeError("Le robot a dévié pendant la mesure de son cap initial.")
             if math.dist(self.depart, filtre) >= self.amorce:
+                self._duree_amorce += self._temps_etat
                 self._changer_etat("MESURE DU CAP")
             else:
                 self._avancer(erreur, filtre)
@@ -189,11 +234,9 @@ class NavigationRectangle:
         elif self.etat == "ROTATION":
             self._rotation(maintenant, cap)
         elif self.etat == "AVANCE":
-            cible = self.sommets[(self.cote + 1) % 4]
             restant, lateral = self._position_sur_cote(filtre)
-            approche = nouveau and (math.dist(point, cible) <= self.tolerance
-                                    or self._position_sur_cote(point)[0] <= 0)
-            if approche or math.dist(filtre, cible) <= 2 * self.tolerance or restant <= 0:
+            freinage = self._distance_freinage(maintenant, nouveau, restant)
+            if restant <= freinage or (nouveau and self._position_sur_cote(point)[0] <= 0):
                 self._changer_etat("CONFIRMATION DU COIN")
             else:
                 correction = math.degrees(math.atan2(-lateral, max(0.45, 3 * self.tolerance)))
@@ -204,8 +247,10 @@ class NavigationRectangle:
                 else:
                     self._avancer(erreur, filtre)
         elif self.etat == "APPROCHE DU COIN":
-            cible = self.sommets[(self.cote + 1) % 4]
-            if self._temps_etat >= 0.18 or math.dist(point, cible) <= self.tolerance:
+            # Une trame aberrante ne doit pas annuler chaque petite avance.
+            if self._fin_approche is None:
+                self._fin_approche = maintenant + self._duree_approche
+            if maintenant >= self._fin_approche:
                 self._changer_etat("CONFIRMATION DU COIN")
             else:
                 self._avancer(ecart_cap(self.cap_cible, cap), filtre)
@@ -213,9 +258,11 @@ class NavigationRectangle:
             repos = self._position_au_repos(nouveau, point)
             if repos is None:
                 return
-            if math.dist(repos, self.sommets[(self.cote + 1) % 4]) > self.tolerance:
-                self._approcher_coin(repos)
+            restant, lateral = self._position_sur_cote(repos)
+            if not self._coin_atteint(restant, lateral):
+                self._approcher_coin(repos, cap, restant, lateral)
                 return
+            self.coins_mesures.append(repos)
             self.cote += 1
             self._temps_cote = 0.0
             if self.cote == 4:
@@ -233,6 +280,9 @@ class NavigationRectangle:
                         and mesure[0] >= self._dernier_fix)
         nouveau = radio_valide and mesure[0] > self._dernier_fix
         if nouveau:
+            intervalle = mesure[0] - self._dernier_fix
+            if math.isfinite(intervalle):
+                self._intervalles_gps.append(min(intervalle, self.age_gps))
             self._dernier_fix, x, y = mesure
             self._points.append((x, y))
         if not radio_valide:
@@ -246,6 +296,7 @@ class NavigationRectangle:
             self.attente = ""
         if self.attente:
             self.robot.arreter()
+            self._reference_vitesse = None
             cap_valide = cap is not None and math.isfinite(cap)
             if voie_libre is False or not radio_valide or not cap_valide:
                 self._libre_depuis = None
