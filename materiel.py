@@ -154,6 +154,7 @@ class Capteurs:
                     raise RuntimeError("Échantillonnage interrompu, le cap doit être réinitialisé au départ.")
                 vitesse = (gx - biais) * self._sens_gyro
                 angle += (vitesse_precedente + vitesse) * (instant - instant_precedent) / 2
+                angle %= 360
                 vitesse_precedente = vitesse
             if biais is not None:
                 with self._verrou:
